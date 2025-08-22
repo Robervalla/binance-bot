@@ -1,8 +1,9 @@
-# --- server.py (VERSIÓN ROBUSTA Y UNIFICADA) ---
+# --- server.py (VERSIÓN ROBUSTA + /ping) ---
 import os
 import json
 import logging
 import math
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -13,12 +14,10 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
 app = Flask(__name__)
+START_TS = datetime.now(timezone.utc)
 
 # --- 2. CREDENCIALES Y CLIENTE DE BINANCE ---
 API_KEY = os.getenv("API_KEY")
@@ -60,11 +59,10 @@ def adjust_quantity(quantity, step_size, min_qty):
     return formatted_quantity
 
 def close_position_for_symbol(symbol):
-    """Función para encontrar y cerrar cualquier posición abierta para un símbolo."""
+    """Cierra cualquier posición abierta para un símbolo."""
     try:
         positions = client.futures_position_information(symbol=symbol)
         position = next((p for p in positions if p['symbol'] == symbol and float(p['positionAmt']) != 0), None)
-        
         if not position:
             logging.info(f"No hay posición abierta para {symbol}. No se requiere cierre.")
             return True, "No position to close."
@@ -73,20 +71,19 @@ def close_position_for_symbol(symbol):
         side_to_close = 'SELL' if position_amount > 0 else 'BUY'
         quantity_to_close = abs(position_amount)
 
-        # Cancelar todas las órdenes abiertas para evitar conflictos (ej. TSL anterior)
         client.futures_cancel_all_open_orders(symbol=symbol)
         logging.info(f"Canceladas todas las órdenes abiertas para {symbol} antes de cerrar.")
-        
+
         logging.info(f"Cerrando posición existente para {symbol}: Lado={side_to_close}, Cantidad={quantity_to_close}")
         close_order = client.futures_create_order(
             symbol=symbol, side=side_to_close, type='MARKET', quantity=quantity_to_close
         )
         logging.info(f"Posición para {symbol} cerrada exitosamente. ID: {close_order['orderId']}")
         return True, close_order['orderId']
-        
+
     except BinanceAPIException as e:
-        if e.code == -2022: # Code for "ReduceOnly Order is rejected"
-            logging.warning(f"No se pudo cerrar la posición para {symbol} porque ya estaba cerrada o en proceso. Error: {e}")
+        if e.code == -2022:
+            logging.warning(f"No se pudo cerrar la posición para {symbol} (probablemente ya cerrada). Error: {e}")
             return True, "Position likely already closed."
         logging.error(f"Error de API al cerrar posición para {symbol}: {e}")
         return False, str(e)
@@ -94,21 +91,37 @@ def close_position_for_symbol(symbol):
         logging.error(f"Error inesperado al cerrar posición para {symbol}: {e}")
         return False, str(e)
 
+# --- 4. ENDPOINTS DE SALUD / KEEP-ALIVE ---
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({
+        "status": "ok",
+        "service": "binance-bot",
+        "uptime_seconds": int((datetime.now(timezone.utc) - START_TS).total_seconds())
+    }), 200
 
-# --- 4. RUTA DEL WEBHOOK UNIFICADO ---
+@app.route('/ping', methods=['GET', 'HEAD'])
+def ping():
+    return jsonify({
+        "status": "alive",
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds": int((datetime.now(timezone.utc) - START_TS).total_seconds())
+    }), 200
+
+# --- 5. RUTA DEL WEBHOOK UNIFICADO ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    try:
-        data = request.get_json()
-    except Exception:
-        return jsonify({"status": "error", "message": "JSON malformado"}), 400
-    
+    # Acepta JSON aunque no venga con Content-Type application/json (caso TradingView)
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "JSON malformado o vacío"}), 400
+
     logging.info(f"Webhook recibido: {data}")
-    
+
     if data.get("secret") != WEBHOOK_SECRET:
         logging.warning("Acceso no autorizado (clave secreta inválida).")
         return jsonify({"status": "error", "message": "No autorizado"}), 401
-    
+
     try:
         symbol = data['symbol'].upper()
         action = data['side'].upper()
@@ -116,7 +129,6 @@ def webhook():
         return jsonify({"status": "error", "message": f"Dato requerido faltante: {e}"}), 400
 
     # --- LÓGICA DE ACCIÓN ---
-    # Acción 1: Simplemente cerrar la posición
     if action == 'CLOSE':
         success, message = close_position_for_symbol(symbol)
         if success:
@@ -124,29 +136,27 @@ def webhook():
         else:
             return jsonify({"status": "error", "message": message}), 500
 
-    # Acción 2: Abrir una nueva posición (LONG o SHORT)
     elif action in ['LONG', 'BUY', 'SHORT', 'SELL']:
-        # Primero, cerrar cualquier posición existente para este símbolo
         close_success, _ = close_position_for_symbol(symbol)
         if not close_success:
-            logging.error(f"Fallo crítico: No se pudo cerrar la posición existente para {symbol}. Se aborta la nueva orden.")
+            logging.error(f"No se pudo cerrar la posición existente para {symbol}. Se aborta la nueva orden.")
             return jsonify({"status": "error", "message": "No se pudo cerrar la posición existente antes de abrir una nueva."}), 500
 
         try:
-            # Continuar con la creación de la nueva orden
             side = 'BUY' if action in ['LONG', 'BUY'] else 'SELL'
-            leverage = int(data['lev'])
+            leverage = int(float(data['lev']))
             usdt_amount = float(data['usdt'])
             tsl_percent = float(data.get('tsl', 0))
 
             info = get_symbol_info(symbol)
-            if not info: raise ValueError(f"No se pudo obtener info para {symbol}")
+            if not info:
+                raise ValueError(f"No se pudo obtener info para {symbol}")
 
             client.futures_change_leverage(symbol=symbol, leverage=leverage)
             mark_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
             quantity_unformatted = (usdt_amount * leverage) / mark_price
             quantity = adjust_quantity(quantity_unformatted, info['stepSize'], info['minQty'])
-            
+
             if quantity <= 0:
                 msg = f"La cantidad calculada ({quantity_unformatted:.8f}) es demasiado pequeña."
                 logging.error(msg)
@@ -155,7 +165,7 @@ def webhook():
             logging.info(f"Abriendo {side} para {quantity} {symbol} a precio de mercado.")
             order = client.futures_create_order(symbol=symbol, side=side, type='MARKET', quantity=quantity)
             logging.info(f"¡ÉXITO! Orden MARKET enviada. ID: {order['orderId']}")
-            
+
             if 0.1 <= tsl_percent <= 5:
                 tsl_side = 'SELL' if side == 'BUY' else 'BUY'
                 tsl_order = client.futures_create_order(
@@ -174,9 +184,10 @@ def webhook():
         except Exception as e:
             logging.error(f"Un error inesperado ocurrió al abrir: {e}")
             return jsonify({"status": "error", "message": str(e)}), 500
-    
+
     else:
         return jsonify({"status": "error", "message": f"Acción '{action}' no reconocida. Usar LONG, SHORT o CLOSE."}), 400
 
 if __name__ == '__main__':
+    # Nota: en producción usá gunicorn:  gunicorn server:app --preload --timeout 120 --workers 1 --threads 4
     app.run(host='0.0.0.0', port=5000, debug=False)
